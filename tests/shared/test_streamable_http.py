@@ -2376,7 +2376,7 @@ async def _next_live_sse_data(lines: AsyncIterator[str]) -> dict[str, Any] | Non
 async def test_concurrent_typed_ids_receive_only_their_own_responses(
     json_response: bool, request_ids: tuple[types.RequestId, types.RequestId], cancel_first: bool
 ) -> None:
-    """JSON-RPC typed IDs retain separate responses, including cancellation replies (spec-mandated).
+    """Integer and string IDs keep success and cancellation responses on their own POST streams.
 
     Raw HTTP supplies the explicit IDs that the high-level client automatically generates.
     """
