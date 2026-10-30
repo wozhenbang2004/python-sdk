@@ -53,6 +53,7 @@ from mcp.server.streamable_http import (
     GET_STREAM_KEY,
     MCP_PROTOCOL_VERSION_HEADER,
     MCP_SESSION_ID_HEADER,
+    REQUEST_CANCELLED,
     SESSION_ID_PATTERN,
     EventCallback,
     EventId,
@@ -2304,12 +2305,12 @@ async def test_standalone_stream_teardown_between_dequeues_is_not_an_error(
     stream_registered = anyio.Event()
 
     class SignalingStreams(
-        dict[types.RequestId, tuple[MemoryObjectSendStream[EventMessage], MemoryObjectReceiveStream[EventMessage]]]
+        dict[StreamId, tuple[MemoryObjectSendStream[EventMessage], MemoryObjectReceiveStream[EventMessage]]]
     ):
         # Only the GET handler inserts here, so any insert is the standalone stream registration.
         def __setitem__(
             self,
-            key: types.RequestId,
+            key: StreamId,
             value: tuple[MemoryObjectSendStream[EventMessage], MemoryObjectReceiveStream[EventMessage]],
         ) -> None:
             super().__setitem__(key, value)
@@ -2359,3 +2360,197 @@ async def test_standalone_stream_teardown_between_dequeues_is_not_an_error(
     assert body_chunks[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
     assert "Error in standalone SSE writer" not in caplog.text
     assert "Error in standalone SSE response" not in caplog.text
+
+async def _next_live_sse_data(lines: AsyncIterator[str]) -> dict[str, Any] | None:
+    async for line in lines:
+        if line.startswith("data: ") and line[6:]:
+            return json.loads(line[6:])
+    return None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("json_response", [False, True])
+@pytest.mark.parametrize("request_ids", [(77, "77"), ("77", 77), (0, "0"), (77, "int:77"), ("77", "str:77")])
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_concurrent_typed_ids_receive_only_their_own_responses(
+    json_response: bool, request_ids: tuple[types.RequestId, types.RequestId], cancel_first: bool
+) -> None:
+    """JSON-RPC typed IDs retain separate responses, including cancellation replies (spec-mandated).
+
+    Raw HTTP supplies the explicit IDs that the high-level client automatically generates.
+    """
+    transport = StreamableHTTPServerTransport(
+        mcp_session_id=None,
+        is_json_response_enabled=json_response,
+        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    replies: list[types.JSONRPCResponse | types.JSONRPCError] = [
+        types.JSONRPCResponse(jsonrpc="2.0", id=request_ids[0], result={"index": 0}),
+        types.JSONRPCResponse(jsonrpc="2.0", id=request_ids[1], result={"index": 1}),
+    ]
+    if cancel_first:
+        replies[0] = types.JSONRPCError(
+            jsonrpc="2.0",
+            id=request_ids[0],
+            error=types.ErrorData(code=REQUEST_CANCELLED, message="Request cancelled"),
+        )
+    notifications = [
+        types.JSONRPCNotification(
+            jsonrpc="2.0", method="notifications/message", params={"level": "info", "data": request_id}
+        )
+        for request_id in request_ids
+    ]
+    responses: list[httpx2.Response | None] = [None, None]
+    headers = {"Accept": "application/json, text/event-stream"}
+
+    with anyio.fail_after(5):
+        async with transport.connect() as (incoming, outgoing):
+            async with httpx2.AsyncClient(
+                transport=StreamingASGITransport(transport.handle_request), base_url=BASE_URL
+            ) as client:
+
+                async def post(index: int) -> None:
+                    responses[index] = await client.post(
+                        "/", headers=headers, json={"jsonrpc": "2.0", "id": request_ids[index], "method": "ping"}
+                    )
+
+                async with anyio.create_task_group() as tg:
+                    for index, request_id in enumerate(request_ids):
+                        tg.start_soon(post, index)
+                        forwarded = await incoming.receive()
+                        assert isinstance(forwarded, SessionMessage)
+                        assert isinstance(forwarded.message, JSONRPCRequest)
+                        assert type(forwarded.message.id) is type(request_id)
+                        assert forwarded.message.id == request_id
+                    # Both POSTs are registered before either response is sent.
+                    for index, request_id in enumerate(request_ids):
+                        await outgoing.send(
+                            SessionMessage(
+                                notifications[index], metadata=ServerMessageMetadata(related_request_id=request_id)
+                            )
+                        )
+                        await outgoing.send(SessionMessage(replies[index]))
+            await transport.terminate()
+
+    for index, response in enumerate(responses):
+        assert response is not None
+        assert response.status_code == 200
+        expected = replies[index].model_dump(by_alias=True, exclude_unset=True)
+        if json_response:
+            assert response.json() == expected
+        else:
+            payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+            assert payloads == [notifications[index].model_dump(by_alias=True, exclude_unset=True), expected]
+
+
+@pytest.mark.anyio
+async def test_request_id_matching_get_sentinel_keeps_notifications_on_get() -> None:
+    """A string request ID cannot replace the standalone stream (SDK-defined GET isolation).
+
+    Raw HTTP supplies the reserved-looking ID and observes the second GET's status code.
+    """
+    transport = StreamableHTTPServerTransport(
+        mcp_session_id=None,
+        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    notification = types.JSONRPCNotification(jsonrpc="2.0", method="notifications/resources/list_changed")
+    response: httpx2.Response | None = None
+    with anyio.fail_after(5):
+        async with transport.connect() as (incoming, outgoing):
+            async with httpx2.AsyncClient(
+                transport=StreamingASGITransport(transport.handle_request), base_url=BASE_URL
+            ) as client:
+                async with client.stream("GET", "/", headers={"Accept": "text/event-stream"}) as get_response:
+                    assert get_response.status_code == 200
+                    lines = get_response.aiter_lines()
+                    await outgoing.send(SessionMessage(notification))
+                    assert await _next_live_sse_data(lines) == notification.model_dump(
+                        by_alias=True, exclude_unset=True
+                    )
+
+                    async def post() -> None:
+                        nonlocal response
+                        response = await client.post(
+                            "/",
+                            headers={"Accept": "application/json, text/event-stream"},
+                            json={"jsonrpc": "2.0", "id": GET_STREAM_KEY, "method": "ping"},
+                        )
+
+                    async with anyio.create_task_group() as tg:
+                        tg.start_soon(post)
+                        forwarded = await incoming.receive()
+                        assert isinstance(forwarded, SessionMessage)
+                        assert isinstance(forwarded.message, JSONRPCRequest)
+                        assert forwarded.message.id == GET_STREAM_KEY
+                        await outgoing.send(SessionMessage(notification))
+                        assert await _next_live_sse_data(lines) == notification.model_dump(
+                            by_alias=True, exclude_unset=True
+                        )
+                        second_get = await client.get("/", headers={"Accept": "text/event-stream"})
+                        assert second_get.status_code == 409
+                        await outgoing.send(
+                            SessionMessage(types.JSONRPCResponse(jsonrpc="2.0", id=GET_STREAM_KEY, result={}))
+                        )
+            await transport.terminate()
+    assert response is not None
+    assert response.status_code == 200
+    assert first_sse_data(response)["id"] == GET_STREAM_KEY
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("request_id", [77, "77", 0, "0", "_GET_stream", "int:77", "str:77"])
+@pytest.mark.parametrize("via_callback", [False, True])
+async def test_closing_a_raw_request_id_keeps_the_get_stream_open(
+    request_id: types.RequestId, via_callback: bool
+) -> None:
+    """The raw-ID close API and request callback close only their POST, then GET closes independently.
+
+    Raw HTTP supplies string IDs and observes stream completion rather than internal registry keys.
+    """
+    transport = StreamableHTTPServerTransport(
+        mcp_session_id=None,
+        event_store=SimpleEventStore(),
+        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    notification = types.JSONRPCNotification(jsonrpc="2.0", method="notifications/resources/list_changed")
+    with anyio.fail_after(5):
+        async with transport.connect() as (incoming, outgoing):
+            async with httpx2.AsyncClient(
+                transport=StreamingASGITransport(transport.handle_request), base_url=BASE_URL
+            ) as client:
+                async with client.stream("GET", "/", headers={"Accept": "text/event-stream"}) as get_response:
+                    assert get_response.status_code == 200
+                    lines = get_response.aiter_lines()
+                    await outgoing.send(SessionMessage(notification))
+                    assert await _next_live_sse_data(lines) == notification.model_dump(
+                        by_alias=True, exclude_unset=True
+                    )
+                    async with client.stream(
+                        "POST",
+                        "/",
+                        headers={
+                            "Accept": "application/json, text/event-stream",
+                            MCP_PROTOCOL_VERSION_HEADER: "2025-11-25",
+                        },
+                        json={"jsonrpc": "2.0", "id": request_id, "method": "ping"},
+                    ) as post_response:
+                        assert post_response.status_code == 200
+                        forwarded = await incoming.receive()
+                        assert isinstance(forwarded, SessionMessage)
+                        assert isinstance(forwarded.message, JSONRPCRequest)
+                        assert type(forwarded.message.id) is type(request_id)
+                        assert forwarded.message.id == request_id
+                        if via_callback:
+                            assert isinstance(forwarded.metadata, ServerMessageMetadata)
+                            assert forwarded.metadata.close_sse_stream is not None
+                            await forwarded.metadata.close_sse_stream()
+                        else:
+                            transport.close_sse_stream(request_id)
+                        assert await _next_live_sse_data(post_response.aiter_lines()) is None
+                    await outgoing.send(SessionMessage(notification))
+                    assert await _next_live_sse_data(lines) == notification.model_dump(
+                        by_alias=True, exclude_unset=True
+                    )
+                    transport.close_standalone_sse_stream()
+                    assert await _next_live_sse_data(lines) is None
+            await transport.terminate()
