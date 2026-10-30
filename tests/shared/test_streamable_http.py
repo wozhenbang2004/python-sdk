@@ -2361,6 +2361,7 @@ async def test_standalone_stream_teardown_between_dequeues_is_not_an_error(
     assert "Error in standalone SSE writer" not in caplog.text
     assert "Error in standalone SSE response" not in caplog.text
 
+
 async def _next_live_sse_data(lines: AsyncIterator[str]) -> dict[str, Any] | None:
     async for line in lines:
         if line.startswith("data: ") and line[6:]:
@@ -2500,9 +2501,7 @@ async def test_request_id_matching_get_sentinel_keeps_notifications_on_get() -> 
 @pytest.mark.anyio
 @pytest.mark.parametrize("request_id", [77, "77", 0, "0", "_GET_stream", "int:77", "str:77"])
 @pytest.mark.parametrize("via_callback", [False, True])
-async def test_closing_a_raw_request_id_keeps_the_get_stream_open(
-    request_id: types.RequestId, via_callback: bool
-) -> None:
+async def test_raw_id_close_keeps_the_get_stream_open(request_id: types.RequestId, via_callback: bool) -> None:
     """The raw-ID close API and request callback close only their POST, then GET closes independently.
 
     Raw HTTP supplies string IDs and observes stream completion rather than internal registry keys.
