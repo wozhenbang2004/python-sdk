@@ -57,10 +57,10 @@ async def test_router_unconsumed_request_stream_does_not_block_siblings() -> Non
         # Model two concurrent POSTs at the point _handle_post_request has
         # registered the per-request stream but A's sse_writer has not yet
         # reached its first receive().
-        streams["A"] = anyio.create_memory_object_stream[EventMessage](REQUEST_STREAM_BUFFER_SIZE)
-        streams["B"] = anyio.create_memory_object_stream[EventMessage](REQUEST_STREAM_BUFFER_SIZE)
-        a_send, a_recv = streams["A"]
-        b_reader = streams["B"][1]
+        streams["str:A"] = anyio.create_memory_object_stream[EventMessage](REQUEST_STREAM_BUFFER_SIZE)
+        streams["str:B"] = anyio.create_memory_object_stream[EventMessage](REQUEST_STREAM_BUFFER_SIZE)
+        a_send, a_recv = streams["str:A"]
+        b_reader = streams["str:B"][1]
         b_received = anyio.Event()
 
         async def consume_b() -> None:
