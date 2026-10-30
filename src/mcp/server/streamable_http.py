@@ -84,6 +84,11 @@ EventId = str
 SSEEvent = dict[str, Any]
 
 
+def _request_stream_key(request_id: RequestId) -> StreamId:
+    kind = "int" if isinstance(request_id, int) else "str"
+    return f"{kind}:{request_id}"
+
+
 def check_accept_headers(request: Request) -> tuple[bool, bool]:
     """Return (has_json, has_sse) for the request's Accept header, with RFC 7231 wildcard handling.
 
@@ -212,13 +217,13 @@ class StreamableHTTPServerTransport:
         self._security = TransportSecurityMiddleware(security_settings)
         self._retry_interval = retry_interval
         self._request_streams: dict[
-            RequestId,
+            StreamId,
             tuple[
                 MemoryObjectSendStream[EventMessage],
                 MemoryObjectReceiveStream[EventMessage],
             ],
         ] = {}
-        self._sse_stream_writers: dict[RequestId, MemoryObjectSendStream[SSEEvent]] = {}
+        self._sse_stream_writers: dict[StreamId, MemoryObjectSendStream[SSEEvent]] = {}
         self._terminated = False
         self._idle_timeout = idle_timeout
         self._requests_in_flight = 0
@@ -272,13 +277,16 @@ class StreamableHTTPServerTransport:
             Requires event_store to be configured for events to be stored during
             the disconnect.
         """
-        writer = self._sse_stream_writers.pop(request_id, None)
+        self._close_sse_stream(_request_stream_key(request_id))
+
+    def _close_sse_stream(self, stream_id: StreamId) -> None:
+        writer = self._sse_stream_writers.pop(stream_id, None)
         if writer:  # pragma: no branch
             writer.close()
 
         # Also close and remove request streams
-        if request_id in self._request_streams:  # pragma: no branch
-            send_stream, receive_stream = self._request_streams.pop(request_id)
+        if stream_id in self._request_streams:  # pragma: no branch
+            send_stream, receive_stream = self._request_streams.pop(stream_id)
             send_stream.close()
             receive_stream.close()
 
@@ -297,13 +305,13 @@ class StreamableHTTPServerTransport:
             Requires event_store to be configured for events to be stored during
             the disconnect.
         """
-        self.close_sse_stream(GET_STREAM_KEY)
+        self._close_sse_stream(GET_STREAM_KEY)
 
     def _create_session_message(
         self,
         message: JSONRPCRequest,
         request: Request,
-        request_id: RequestId,
+        request_id: StreamId,
         protocol_version: str,
     ) -> SessionMessage:
         """Create a session message with metadata including close_sse_stream callback.
@@ -319,7 +327,7 @@ class StreamableHTTPServerTransport:
         if self._event_store and is_version_at_least(protocol_version, "2025-11-25"):
 
             async def close_stream_callback() -> None:
-                self.close_sse_stream(request_id)
+                self._close_sse_stream(request_id)
 
             async def close_standalone_stream_callback() -> None:
                 self.close_standalone_sse_stream()
@@ -355,7 +363,7 @@ class StreamableHTTPServerTransport:
 
     async def _run_sse_writer(
         self,
-        request_id: RequestId,
+        request_id: StreamId,
         sse_stream_writer: MemoryObjectSendStream[SSEEvent],
         request_stream_reader: MemoryObjectReceiveStream[EventMessage],
         priming_event: SSEEvent | None,
@@ -457,7 +465,7 @@ class StreamableHTTPServerTransport:
         error = ErrorData(code=REQUEST_CANCELLED, message="Request cancelled")
         await self._write_stream.send(SessionMessage(JSONRPCError(jsonrpc="2.0", id=request_id, error=error)))
 
-    async def _clean_up_memory_streams(self, request_id: RequestId) -> None:
+    async def _clean_up_memory_streams(self, request_id: StreamId) -> None:
         """Clean up memory streams for a given request ID."""
         if request_id in self._request_streams:  # pragma: no branch
             try:
@@ -639,7 +647,7 @@ class StreamableHTTPServerTransport:
                 else request.headers.get(MCP_PROTOCOL_VERSION_HEADER, DEFAULT_NEGOTIATED_VERSION)
             )
 
-            request_id = str(message.id)
+            request_id = _request_stream_key(message.id)
 
             if self.is_json_response_enabled:
                 self._request_streams[request_id] = anyio.create_memory_object_stream[EventMessage](
@@ -1063,7 +1071,7 @@ class StreamableHTTPServerTransport:
                         # Null-id errors (e.g., parse errors) fall through to
                         # the GET stream since they can't be correlated.
                         if isinstance(message, JSONRPCResponse | JSONRPCError) and message.id is not None:
-                            target_request_id = str(message.id)
+                            target_request_id = _request_stream_key(message.id)
                         # Extract related_request_id from meta if it exists
                         elif (
                             session_message.metadata is not None
@@ -1080,7 +1088,7 @@ class StreamableHTTPServerTransport:
                                 # storing or queueing rather than park it (#1764).
                                 logger.debug(f"Dropped message related to request {related_request_id} in JSON mode")
                                 continue
-                            target_request_id = str(related_request_id)
+                            target_request_id = _request_stream_key(related_request_id)
 
                         request_stream_id = target_request_id if target_request_id is not None else GET_STREAM_KEY
 
